@@ -1,0 +1,238 @@
+name: Build latest Unigram
+
+on:
+  workflow_dispatch:
+    inputs:
+      architecture:
+        description: Windows architecture
+        required: true
+        default: x64
+        type: choice
+        options:
+          - x64
+          - ARM64
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Unigram
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 360
+
+    env:
+      TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+      TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+
+    steps:
+      - name: Checkout latest Unigram
+        uses: actions/checkout@v5
+        with:
+          repository: UnigramDev/Unigram
+          ref: develop
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Find MSBuild
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+
+          if (-not (Test-Path $vswhere)) {
+              throw "vswhere.exe was not found"
+          }
+
+          $vs = & $vswhere `
+              -latest `
+              -prerelease `
+              -products * `
+              -requires Microsoft.Component.MSBuild `
+              -property installationPath
+
+          if (-not $vs) {
+              throw "Visual Studio with MSBuild was not found"
+          }
+
+          $msbuildDir = Join-Path $vs "MSBuild\Current\Bin\amd64"
+
+          if (-not (Test-Path $msbuildDir)) {
+              throw "MSBuild directory was not found: $msbuildDir"
+          }
+
+          $msbuildDir | Out-File `
+              -FilePath $env:GITHUB_PATH `
+              -Encoding utf8 `
+              -Append
+
+          Write-Host "Visual Studio: $vs"
+          Write-Host "MSBuild: $msbuildDir"
+
+      - name: Check build tools
+        shell: pwsh
+        run: |
+          msbuild -version
+          cmake --version
+          php --version
+
+      - name: Check Telegram credentials
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TELEGRAM_API_ID)) {
+              throw "Repository secret TELEGRAM_API_ID is missing"
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:TELEGRAM_API_HASH)) {
+              throw "Repository secret TELEGRAM_API_HASH is missing"
+          }
+
+          if ($env:TELEGRAM_API_ID -notmatch '^\d+$') {
+              throw "TELEGRAM_API_ID must contain digits only"
+          }
+
+          if ($env:TELEGRAM_API_HASH -notmatch '^[0-9a-fA-F]+$') {
+              throw "TELEGRAM_API_HASH does not look like a Telegram API hash"
+          }
+
+      - name: Create Constants.Secret.cs
+        shell: pwsh
+        run: |
+          $file = @"
+          namespace Telegram
+          {
+              public static partial class Constants
+              {
+                  static Constants()
+                  {
+                      ApiId = $env:TELEGRAM_API_ID;
+                      ApiHash = "$env:TELEGRAM_API_HASH";
+                      AppChannel = "";
+                  }
+              }
+          }
+          "@
+
+          Set-Content `
+              -Path "Telegram\Constants.Secret.cs" `
+              -Value $file `
+              -Encoding UTF8
+
+          Write-Host "Telegram\Constants.Secret.cs created"
+
+      - name: Prepare matching vcpkg
+        shell: pwsh
+        run: |
+          $manifest = Get-Content ".\vcpkg.json" -Raw | ConvertFrom-Json
+          $baseline = $manifest.'builtin-baseline'
+
+          if ([string]::IsNullOrWhiteSpace($baseline)) {
+              throw "builtin-baseline was not found in vcpkg.json"
+          }
+
+          Write-Host "Unigram vcpkg baseline: $baseline"
+
+          $vcpkgPath = "C:\unigram-vcpkg"
+
+          if (Test-Path $vcpkgPath) {
+              Remove-Item $vcpkgPath -Recurse -Force
+          }
+
+          git clone https://github.com/microsoft/vcpkg.git $vcpkgPath
+
+          Push-Location $vcpkgPath
+          git checkout $baseline
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Unable to checkout vcpkg baseline $baseline"
+          }
+
+          .\bootstrap-vcpkg.bat -disableMetrics
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "vcpkg bootstrap failed"
+          }
+
+          Pop-Location
+
+          "VCPKG_ROOT=$vcpkgPath" |
+              Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+      - name: Build TDLib
+        shell: powershell
+        run: |
+          Set-Location "Libraries\tdjson"
+
+          .\build.ps1 -arch "${{ inputs.architecture }}"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "TDLib build failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Build Unigram MSIX
+        shell: powershell
+        run: |
+          .\Build.ps1 `
+              -arch "${{ inputs.architecture }}" `
+              -mode "SideloadOnly"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Unigram build failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Show generated packages
+        shell: pwsh
+        run: |
+          $packages = Get-ChildItem `
+              -Path . `
+              -Recurse `
+              -File `
+              -Include *.msixbundle,*.msix,*.appxbundle,*.appx,*.cer,Add-AppDevPackage.ps1 `
+              -ErrorAction SilentlyContinue
+
+          if (-not $packages) {
+              throw "No MSIX/AppX package was found after build"
+          }
+
+          $packages |
+              Select-Object FullName, Length |
+              Format-Table -AutoSize
+
+      - name: Collect installation files
+        shell: pwsh
+        run: |
+          New-Item `
+              -ItemType Directory `
+              -Path "build-artifact" `
+              -Force | Out-Null
+
+          $packageDirs = Get-ChildItem `
+              -Path . `
+              -Recurse `
+              -Directory `
+              -Filter AppPackages `
+              -ErrorAction SilentlyContinue
+
+          if (-not $packageDirs) {
+              throw "No AppPackages directory was generated"
+          }
+
+          foreach ($dir in $packageDirs) {
+              Write-Host "Copying $($dir.FullName)"
+              Copy-Item `
+                  -Path "$($dir.FullName)\*" `
+                  -Destination "build-artifact" `
+                  -Recurse `
+                  -Force
+          }
+
+      - name: Upload Unigram package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Unigram-${{ inputs.architecture }}
+          path: build-artifact/**
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
