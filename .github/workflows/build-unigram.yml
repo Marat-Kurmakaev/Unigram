@@ -26,21 +26,38 @@ jobs:
       TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
 
     steps:
+      # ------------------------------------------------------------
+      # 1. Source code
+      # ------------------------------------------------------------
+
       - name: Checkout latest Unigram
         uses: actions/checkout@v5
         with:
           repository: UnigramDev/Unigram
           ref: develop
           submodules: recursive
-          fetch-depth: 1
 
-      - name: Find MSBuild
+          # IMPORTANT:
+          # UpdateManifest.ps1 uses:
+          #
+          #   git rev-list --count HEAD
+          #
+          # A shallow checkout would always give a tiny/incorrect
+          # build number such as 1.
+          fetch-depth: 0
+
+      # ------------------------------------------------------------
+      # 2. Visual Studio / MSBuild
+      # ------------------------------------------------------------
+
+      - name: Find Visual Studio and MSBuild
         shell: pwsh
         run: |
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installerDir = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
+          $vswhere = Join-Path $installerDir "vswhere.exe"
 
           if (-not (Test-Path $vswhere)) {
-              throw "vswhere.exe was not found"
+              throw "vswhere.exe was not found at $vswhere"
           }
 
           $vs = & $vswhere `
@@ -50,7 +67,7 @@ jobs:
               -requires Microsoft.Component.MSBuild `
               -property installationPath
 
-          if (-not $vs) {
+          if ([string]::IsNullOrWhiteSpace($vs)) {
               throw "Visual Studio with MSBuild was not found"
           }
 
@@ -60,6 +77,13 @@ jobs:
           if (-not (Test-Path $msbuildExe)) {
               throw "MSBuild.exe was not found at $msbuildExe"
           }
+
+          # Some build tools may themselves need vswhere.
+          $installerDir |
+              Out-File `
+                  -FilePath $env:GITHUB_PATH `
+                  -Encoding utf8 `
+                  -Append
 
           $msbuildDir |
               Out-File `
@@ -74,10 +98,10 @@ jobs:
           Write-Host "MSBuild:"
           Write-Host $msbuildExe
 
-      - name: Check required build tools
+      - name: Check build tools
         shell: pwsh
         run: |
-          Write-Host "MSBuild:"
+          Write-Host "=== MSBuild ==="
           msbuild.exe -version
 
           if ($LASTEXITCODE -ne 0) {
@@ -85,7 +109,7 @@ jobs:
           }
 
           Write-Host ""
-          Write-Host "CMake:"
+          Write-Host "=== CMake ==="
           cmake --version
 
           if ($LASTEXITCODE -ne 0) {
@@ -93,12 +117,24 @@ jobs:
           }
 
           Write-Host ""
-          Write-Host "PHP:"
+          Write-Host "=== PHP ==="
           php --version
 
           if ($LASTEXITCODE -ne 0) {
               throw "PHP check failed"
           }
+
+          Write-Host ""
+          Write-Host "=== Git ==="
+          git --version
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Git check failed"
+          }
+
+      # ------------------------------------------------------------
+      # 3. Telegram credentials
+      # ------------------------------------------------------------
 
       - name: Check Telegram credentials
         shell: pwsh
@@ -133,7 +169,12 @@ jobs:
                   {
                       ApiId = $env:TELEGRAM_API_ID;
                       ApiHash = "$env:TELEGRAM_API_HASH";
+
                       AppChannel = "";
+
+                      // UpdateManifest.ps1 replaces this value
+                      // with git rev-list --count HEAD.
+                      BuildNumber = 0;
                   }
               }
           }
@@ -148,7 +189,11 @@ jobs:
               throw "Telegram\Constants.Secret.cs was not created"
           }
 
-          Write-Host "Telegram\Constants.Secret.cs created"
+          Write-Host "Constants.Secret.cs created"
+
+      # ------------------------------------------------------------
+      # 4. vcpkg
+      # ------------------------------------------------------------
 
       - name: Prepare matching vcpkg
         shell: pwsh
@@ -166,7 +211,7 @@ jobs:
               throw "builtin-baseline was not found in vcpkg.json"
           }
 
-          Write-Host "Unigram vcpkg baseline:"
+          Write-Host "Required vcpkg baseline:"
           Write-Host $baseline
 
           $vcpkgPath = "C:\unigram-vcpkg"
@@ -215,16 +260,57 @@ jobs:
                   -Encoding utf8 `
                   -Append
 
-          Write-Host "VCPKG_ROOT:"
-          Write-Host $vcpkgPath
-
           Write-Host ""
-          Write-Host "vcpkg version:"
+          Write-Host "vcpkg:"
           & $vcpkgExe version
 
           if ($LASTEXITCODE -ne 0) {
               throw "vcpkg version check failed"
           }
+
+      # ------------------------------------------------------------
+      # 5. IMPORTANT: NuGet restore BEFORE TDLib
+      #
+      # Do this before the expensive native build. Otherwise a missing
+      # project.assets.json is discovered only after TDLib has spent
+      # tens of minutes compiling.
+      # ------------------------------------------------------------
+
+      - name: Restore NuGet packages
+        shell: pwsh
+        run: |
+          $arch = "${{ inputs.architecture }}"
+
+          Write-Host "Restoring solution packages for Release|$arch..."
+
+          msbuild.exe Telegram.slnx `
+              -restore `
+              "-p:Configuration=Release" `
+              "-p:Platform=$arch" `
+              "-p:RestorePackagesConfig=true" `
+              -nologo `
+              -verbosity:minimal `
+              -m
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "NuGet restore failed with exit code $LASTEXITCODE"
+          }
+
+          Write-Host ""
+          Write-Host "Checking generated NuGet assets..."
+
+          $stubAssets = "Telegram.Stub\obj\project.assets.json"
+
+          if (-not (Test-Path $stubAssets)) {
+              throw "NuGet restore succeeded but $stubAssets was not generated"
+          }
+
+          Write-Host "Found:"
+          Write-Host (Resolve-Path $stubAssets)
+
+      # ------------------------------------------------------------
+      # 6. gperf
+      # ------------------------------------------------------------
 
       - name: Install gperf
         shell: pwsh
@@ -257,7 +343,8 @@ jobs:
           $gperfExe = Join-Path $gperfDir "gperf.exe"
 
           if (-not (Test-Path $gperfExe)) {
-              Write-Host "Searching for gperf.exe under vcpkg..."
+              Write-Host "Expected gperf location was not found."
+              Write-Host "Searching vcpkg tree..."
 
               $found = Get-ChildItem `
                   -Path $env:VCPKG_ROOT `
@@ -283,18 +370,15 @@ jobs:
 
           $env:Path = "$gperfDir;$env:Path"
 
-          Write-Host "gperf path:"
-          Write-Host $gperfExe
-
           Write-Host ""
-          Write-Host "gperf version:"
+          Write-Host "gperf:"
           & $gperfExe --version
 
           if ($LASTEXITCODE -ne 0) {
               throw "gperf execution failed"
           }
 
-      - name: Verify gperf is available
+      - name: Verify gperf on PATH
         shell: pwsh
         run: |
           $gperf = Get-Command gperf.exe -ErrorAction SilentlyContinue
@@ -303,14 +387,12 @@ jobs:
               throw "gperf.exe is not available on PATH"
           }
 
-          Write-Host "gperf found at:"
+          Write-Host "gperf.exe:"
           Write-Host $gperf.Source
 
-          & $gperf.Source --version
-
-          if ($LASTEXITCODE -ne 0) {
-              throw "gperf verification failed"
-          }
+      # ------------------------------------------------------------
+      # 7. TDLib
+      # ------------------------------------------------------------
 
       - name: Build TDLib
         shell: powershell
@@ -333,25 +415,24 @@ jobs:
               throw "TDLib output directory was not found: $tdDir"
           }
 
-          Write-Host "TDLib output:"
-          Get-ChildItem `
-              -Path $tdDir `
-              -Recurse `
-              -File |
-              Select-Object FullName, Length |
-              Format-Table -AutoSize
-
           $tdjson = Get-ChildItem `
               -Path $tdDir `
               -Filter "tdjson.dll" `
-              -Recurse `
               -File `
+              -Recurse `
               -ErrorAction SilentlyContinue |
               Select-Object -First 1
 
           if (-not $tdjson) {
-              throw "tdjson.dll was not found"
+              throw "tdjson.dll was not found after TDLib build"
           }
+
+          Write-Host "TDLib:"
+          Write-Host $tdjson.FullName
+
+      # ------------------------------------------------------------
+      # 8. Unigram
+      # ------------------------------------------------------------
 
       - name: Build Unigram MSIX
         shell: powershell
@@ -364,35 +445,11 @@ jobs:
               throw "Unigram build failed with exit code $LASTEXITCODE"
           }
 
-      - name: Show generated packages
-        shell: pwsh
-        run: |
-          $packages = Get-ChildItem `
-              -Path . `
-              -Recurse `
-              -File `
-              -ErrorAction SilentlyContinue |
-              Where-Object {
-                  $_.Extension -in @(
-                      ".msixbundle",
-                      ".msix",
-                      ".appxbundle",
-                      ".appx",
-                      ".cer"
-                  ) -or $_.Name -eq "Add-AppDevPackage.ps1"
-              }
+      # ------------------------------------------------------------
+      # 9. Artifact
+      # ------------------------------------------------------------
 
-          if (-not $packages) {
-              throw "No MSIX/AppX installation files were found"
-          }
-
-          Write-Host "Generated installation files:"
-
-          $packages |
-              Select-Object FullName, Length |
-              Format-Table -AutoSize
-
-      - name: Collect installation files
+      - name: Collect installation package
         shell: pwsh
         run: |
           $artifactDir = Join-Path $PWD "build-artifact"
@@ -412,14 +469,14 @@ jobs:
 
           $packageDirs = Get-ChildItem `
               -Path . `
-              -Recurse `
               -Directory `
               -Filter "AppPackages" `
+              -Recurse `
               -ErrorAction SilentlyContinue
 
           if ($packageDirs) {
               foreach ($dir in $packageDirs) {
-                  Write-Host "Copying AppPackages directory:"
+                  Write-Host "Copying:"
                   Write-Host $dir.FullName
 
                   Copy-Item `
@@ -430,12 +487,13 @@ jobs:
               }
           }
           else {
-              Write-Host "No AppPackages directory found. Collecting package files directly."
+              Write-Host "AppPackages directory not found."
+              Write-Host "Searching package files directly..."
 
               $files = Get-ChildItem `
                   -Path . `
-                  -Recurse `
                   -File `
+                  -Recurse `
                   -ErrorAction SilentlyContinue |
                   Where-Object {
                       $_.Extension -in @(
@@ -448,7 +506,7 @@ jobs:
                   }
 
               if (-not $files) {
-                  throw "No installation files could be collected"
+                  throw "No MSIX/AppX installation files were found"
               }
 
               foreach ($file in $files) {
@@ -461,8 +519,8 @@ jobs:
 
           $artifactFiles = Get-ChildItem `
               -Path $artifactDir `
-              -Recurse `
               -File `
+              -Recurse `
               -ErrorAction SilentlyContinue
 
           if (-not $artifactFiles) {
